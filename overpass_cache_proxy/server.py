@@ -90,6 +90,26 @@ def _cache_key(method: str, path: str, data: str) -> str:
     return hashlib.sha256(f"{method}:{path}:{data}".encode("utf-8")).hexdigest()
 
 
+# MINECRAFT-566 comment 55663: the documented official Overpass.ch
+# interpreter contract -- the ONLY upstream_url this proxy will ever attach
+# config.api_key to, mirroring Roads' own
+# RoadTileSource.CREDENTIAL_BOUND_ENDPOINT/shouldSendApiKeyTo, which binds
+# its own direct-mode credential to this exact same origin+path for the
+# same reason: a misconfigured (or, in principle, maliciously changed)
+# upstream_url must never cause the secret to be sent somewhere else.
+OFFICIAL_INTERPRETER_ENDPOINT = "https://api.overpass.ch/v1/interpreter"
+
+
+def _should_send_api_key_to(upstream_url: str) -> bool:
+    """Checked at request time (every call), never cached from startup --
+    an operator changing OVERPASS_UPSTREAM_URL mid-run (a bad env var, a
+    config mistake) must not be able to silently start leaking the key to
+    whatever that now points at, including on the very first request, long
+    before any redirect-following question even arises.
+    """
+    return upstream_url == OFFICIAL_INTERPRETER_ENDPOINT
+
+
 class Config:
     def __init__(
         self,
@@ -151,9 +171,23 @@ def _forward(config: Config, method: str, data: str):
     ``config.upstream_url``) is deliberate: ``upstream_url`` is operator
     configuration, not something a caller controls, so there is no redirect
     or off-host-forwarding risk from a value this function never sees.
+
+    MINECRAFT-566 comment 55663: that is not quite enough on its own —
+    ``config.api_key`` was previously attached whenever it was merely
+    *set*, regardless of what ``config.upstream_url`` actually was, so a
+    misconfigured upstream_url would leak the key on the INITIAL request,
+    before redirect-following was ever relevant. ``_should_send_api_key_to``
+    now gates this exactly like Roads' own ``shouldSendApiKeyTo`` gates its
+    direct-mode credential: only the documented
+    ``OFFICIAL_INTERPRETER_ENDPOINT`` ever receives it. A non-matching
+    upstream_url still gets the request forwarded — this proxy's whole job
+    — just without the credential (fail-open-keyless, the same choice
+    Roads' own sibling function already makes, rather than refusing to
+    serve a request at all over a config mistake unrelated to whether the
+    request itself is sane).
     """
     headers: dict[str, str] = {}
-    if config.api_key:
+    if config.api_key and _should_send_api_key_to(config.upstream_url):
         headers["X-API-Key"] = config.api_key
 
     if method == "GET":

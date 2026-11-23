@@ -375,11 +375,11 @@ class ProxyAcceptanceTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(upstream.call_count, 0)
 
-    def test_proxy_talks_the_real_overpass_ch_contract_to_upstream(self) -> None:
-        """MINECRAFT-566 comment 55657, item 2: the proxy's own outbound call
-        must use the real documented contract -- api.overpass.ch/v1 shape and
-        an X-API-Key header carrying the PROXY's own configured secret, never
-        a client-supplied credential.
+    def test_proxy_never_forwards_a_client_supplied_credential_to_upstream(self) -> None:
+        """MINECRAFT-566 comment 55657, item 2: a client-supplied Authorization
+        header must never reach upstream -- only the proxy's OWN configured
+        api_key, via X-API-Key, is ever a candidate for being sent (and only
+        to the official endpoint; see the key-binding tests below).
         """
         upstream = self._new_upstream()
         config = Config(
@@ -387,7 +387,7 @@ class ProxyAcceptanceTests(unittest.TestCase):
             bind_port=0,
             sqlite_path=self.sqlite_path,
             upstream_url=upstream.url,
-            api_key="proxy-held-secret",
+            api_key=None,
         )
         server = ProxyServer(config, Cache(self.sqlite_path))
         self._servers.append(server)
@@ -395,8 +395,6 @@ class ProxyAcceptanceTests(unittest.TestCase):
         thread.start()
         base = _proxy_base(server)
 
-        # A client-supplied Authorization header must never reach upstream --
-        # only the proxy's own configured api_key, via X-API-Key, does.
         status, body = _post_raw(
             f"{base}/roads/interpreter",
             b"a raw overpass ql query",
@@ -404,7 +402,44 @@ class ProxyAcceptanceTests(unittest.TestCase):
             extra_request_headers={"Authorization": "Bearer a-client-supplied-credential"},
         )
         self.assertEqual(status, 200, body)
-        self.assertEqual(upstream.last_seen_api_key, "proxy-held-secret")
+        self.assertIsNone(upstream.last_seen_api_key)
+
+    def test_configured_key_is_never_sent_to_a_non_official_upstream_url_even_on_the_initial_request(self) -> None:
+        """MINECRAFT-566 comment 55663: a configured api_key must only ever
+        go out to the documented official endpoint -- never to whatever
+        upstream_url happens to be configured, including on the very FIRST
+        request (not just "after a redirect" -- there is no redirect
+        involved in this test at all). Uses the repo's own fake-upstream
+        fixture and a fake, clearly-not-real key; no real credential.
+        """
+        upstream = self._new_upstream()
+        config = Config(
+            bind_host="127.0.0.1",
+            bind_port=0,
+            sqlite_path=self.sqlite_path,
+            upstream_url=upstream.url,  # a loopback fake -- NOT the official endpoint
+            api_key="a-fake-key-that-must-never-be-sent-to-a-non-official-endpoint",
+        )
+        server = ProxyServer(config, Cache(self.sqlite_path))
+        self._servers.append(server)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = _proxy_base(server)
+
+        status, body = _post_raw(f"{base}/roads/interpreter", b"a raw overpass ql query", content_type=None)
+
+        self.assertEqual(status, 200, f"Expected the request to still be forwarded, just keyless; body={body!r}")
+        self.assertIsNone(upstream.last_seen_api_key, "Expected no X-API-Key header on a non-official upstream_url")
+        self.assertEqual(upstream.call_count, 1, "Expected the request to actually reach the (fake) upstream")
+
+    def test_should_send_api_key_to_only_matches_the_exact_official_endpoint(self) -> None:
+        from overpass_cache_proxy.server import OFFICIAL_INTERPRETER_ENDPOINT, _should_send_api_key_to
+
+        self.assertTrue(_should_send_api_key_to(OFFICIAL_INTERPRETER_ENDPOINT))
+        self.assertFalse(_should_send_api_key_to("http://api.overpass.ch/v1/interpreter"))  # wrong scheme
+        self.assertFalse(_should_send_api_key_to("https://api.overpass.ch/v1/interpreter/"))  # trailing slash
+        self.assertFalse(_should_send_api_key_to("https://overpass.ch/api/interpreter"))  # the old placeholder
+        self.assertFalse(_should_send_api_key_to("https://evil.example/v1/interpreter"))  # different host entirely
+        self.assertFalse(_should_send_api_key_to("http://127.0.0.1:8822/api/interpreter"))  # a loopback fake
 
     def test_default_upstream_url_is_the_real_documented_contract(self) -> None:
         self.assertEqual(Config().upstream_url, "https://api.overpass.ch/v1/interpreter")
