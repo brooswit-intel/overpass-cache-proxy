@@ -488,6 +488,105 @@ class ProxyAcceptanceTests(unittest.TestCase):
         self.assertEqual(after_hit["local_hits"] - after_recovery["local_hits"], 1)
         self.assertEqual(after_hit["upstream_sends"] - after_recovery["upstream_sends"], 0)
 
+    def test_200_with_error_remark_is_detected_regardless_of_content_type_casing_or_absence(self) -> None:
+        """MINECRAFT-566 comment 55669 (brooswit review, CHANGES_REQUESTED on
+        3e1085c): the previous ``_is_uncacheable_error_remark`` gated the
+        whole check on a case-SENSITIVE ``"json" in content_type`` substring
+        match before ever looking at the body -- a standards-valid but
+        differently-cased ``Content-Type: Application/JSON`` (HTTP media
+        types are case-insensitive per RFC 9110) bypassed the check
+        entirely and got cached. Detection must be body-based, exactly like
+        Roads' own ``checkForErrorRemark`` -- proven here for a
+        non-canonical mixed-case Content-Type AND for a missing one
+        entirely (this proxy's own ``_forward`` already falls back to
+        ``application/octet-stream`` when upstream sends no Content-Type at
+        all, so this is a real, reachable case, not a hypothetical one).
+        """
+        self._assert_remark_never_cached_then_recovers(remark_content_type="Application/JSON")
+        self._assert_remark_never_cached_then_recovers(remark_content_type="APPLICATION/JSON; charset=UTF-8")
+        self._assert_remark_never_cached_then_recovers(remark_content_type=None)  # no Content-Type header at all
+
+    def _assert_remark_never_cached_then_recovers(self, remark_content_type: str | None) -> None:
+        """The exact same never-cached-then-recovers contract as
+        ``test_200_with_error_remark_is_never_cached_then_recovers_and_caches``
+        above, parameterized over the upstream's Content-Type casing/
+        presence -- the real regression the 55669 fix must prove.
+        """
+        upstream = self._new_upstream()
+        upstream.remark_content_type = remark_content_type
+        proxy = self._new_proxy(upstream.url)
+        base = _proxy_base(proxy)
+        label = urllib.parse.quote(str(remark_content_type), safe="")
+        query_url = f"{base}/roads/interpreter?data=mixed-case-content-type-remark-query-{label}"
+
+        upstream.remark_next = True
+        before = _stats(base)
+        status1, body1 = _get(query_url)
+        after_remark = _stats(base)
+
+        self.assertEqual(status1, 200)
+        self.assertEqual(json.loads(body1).get("remark"), "runtime error: Query timed out.")
+        self.assertEqual(upstream.call_count, 1)
+        self.assertEqual(after_remark["upstream_sends"] - before["upstream_sends"], 1)
+        self.assertEqual(after_remark["local_hits"] - before["local_hits"], 0,
+                          f"Expected the remark response (Content-Type={remark_content_type!r}) to NOT be cached")
+
+        # Not cached: the identical retry genuinely re-reaches upstream
+        # (now a real, recoverable success), never served stale from SQLite.
+        status2, body2 = _get(query_url)
+        after_recovery = _stats(base)
+
+        self.assertEqual(status2, 200)
+        self.assertNotIn("remark", json.loads(body2))
+        self.assertEqual(upstream.call_count, 2, "Expected the retry to actually reach upstream again, not a cache hit")
+        self.assertEqual(after_recovery["upstream_sends"] - after_remark["upstream_sends"], 1)
+        self.assertEqual(after_recovery["local_hits"] - after_remark["local_hits"], 0)
+
+        # The real success response, once it happens, DOES cache normally.
+        status3, body3 = _get(query_url)
+        after_hit = _stats(base)
+
+        self.assertEqual(status3, 200)
+        self.assertEqual(body3, body2)
+        self.assertEqual(upstream.call_count, 2)
+        self.assertEqual(after_hit["local_hits"] - after_recovery["local_hits"], 1)
+        self.assertEqual(after_hit["upstream_sends"] - after_recovery["upstream_sends"], 0)
+
+    def test_non_json_success_body_still_caches_normally_after_the_body_based_remark_fix(self) -> None:
+        """Regression guard for the 55669 fix's own stated risk: making
+        remark detection body-based (dropping the Content-Type gate
+        entirely) must not accidentally stop caching a genuine non-JSON
+        success response. A real XML (or any other non-JSON) 200 body
+        simply fails json.loads inside _is_uncacheable_error_remark --
+        falls through its except clause -- and is cached exactly as before.
+        """
+        upstream = self._new_upstream()
+        upstream.non_json_success_next = True
+        proxy = self._new_proxy(upstream.url)
+        base = _proxy_base(proxy)
+        query_url = f"{base}/roads/interpreter?data=non-json-success-query"
+
+        before = _stats(base)
+        status1, body1 = _get(query_url)
+        after_first = _stats(base)
+
+        self.assertEqual(status1, 200)
+        self.assertEqual(body1, b"<overpass><way id='1'/></overpass>")
+        self.assertEqual(upstream.call_count, 1)
+        self.assertEqual(after_first["upstream_sends"] - before["upstream_sends"], 1)
+        self.assertEqual(after_first["local_hits"] - before["local_hits"], 0)
+
+        # Cached normally: the identical request is now a local hit, no
+        # second upstream send.
+        status2, body2 = _get(query_url)
+        after_second = _stats(base)
+
+        self.assertEqual(status2, 200)
+        self.assertEqual(body2, body1)
+        self.assertEqual(upstream.call_count, 1, "Expected NO second upstream send -- the non-JSON success was cached")
+        self.assertEqual(after_second["local_hits"] - after_first["local_hits"], 1)
+        self.assertEqual(after_second["upstream_sends"] - after_first["upstream_sends"], 0)
+
     def test_uncached_429_preserves_a_safe_numeric_retry_after(self) -> None:
         self._assert_safe_retry_after_preserved(status=429, upstream_retry_after="17")
 

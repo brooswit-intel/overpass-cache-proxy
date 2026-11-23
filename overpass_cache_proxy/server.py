@@ -64,7 +64,7 @@ def _safe_retry_after_seconds(raw_value: str | None) -> int:
     return _DEFAULT_RETRY_AFTER_SECONDS
 
 
-def _is_uncacheable_error_remark(body: bytes, content_type: str) -> bool:
+def _is_uncacheable_error_remark(body: bytes) -> bool:
     """MINECRAFT-566 comment 55657, item 3: Overpass can answer HTTP 200 with a
     body that is valid JSON but carries a non-empty top-level "remark" string
     -- its own error-signaling convention (``Output_JSON::write_footer``,
@@ -73,9 +73,21 @@ def _is_uncacheable_error_remark(body: bytes, content_type: str) -> bool:
     body are therefore not proof of a trustworthy answer; this must be
     checked, and must fail the request uncached, before ``cache.put`` is ever
     reached for it.
+
+    MINECRAFT-566 comment 55669 (brooswit review, CHANGES_REQUESTED on
+    3e1085c): the previous version gated this entirely on a case-SENSITIVE
+    ``"json" in content_type`` substring check before ever looking at the
+    body. HTTP media types are case-insensitive (RFC 9110), so a standards-
+    valid ``Content-Type: Application/JSON`` (or any other casing) bypassed
+    the remark check entirely and reached ``cache.put`` -- caching a
+    transient failure and hiding a real, recovered answer from every later
+    identical request. Fixed to be body-based, matching Roads' own
+    ``checkForErrorRemark`` exactly: parse the body as JSON unconditionally,
+    regardless of what (or whether) Content-Type claims; the existing
+    ``except (ValueError, TypeError)`` below already makes this safe for
+    any genuinely non-JSON success body (a real XML/other-format answer
+    simply fails to parse here and is cached normally, exactly as before).
     """
-    if "json" not in content_type:
-        return False
     try:
         payload = json.loads(body)
     except (ValueError, TypeError):
@@ -315,7 +327,7 @@ def make_handler(cache: Cache, config: Config):
             cache.record_upstream_send()
 
             if status == 200 and complete:
-                if _is_uncacheable_error_remark(body, content_type):
+                if _is_uncacheable_error_remark(body):
                     # A transient runtime failure disguised as HTTP 200 --
                     # never cache it; surface it uncached so the caller
                     # (Roads' own checkForErrorRemark, or any equivalent)

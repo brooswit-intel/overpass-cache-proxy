@@ -24,6 +24,15 @@ class FakeUpstream:
         # cached, `rate_limit_next`/`rate_limit_retry_after_next` to prove a
         # safe Retry-After is preserved on an uncached 429/503.
         self.remark_next = False
+        # MINECRAFT-566 comment 55669: lets a test choose exactly what
+        # Content-Type (if any) accompanies a remark response -- "omit" the
+        # header entirely by setting this to None, or exercise a
+        # non-canonical casing like "Application/JSON".
+        self.remark_content_type: str | None = "application/json"
+        # MINECRAFT-566 comment 55669: a genuine non-JSON success body, to
+        # prove the body-based remark fix doesn't accidentally stop caching
+        # a real non-JSON success response.
+        self.non_json_success_next = False
         self.rate_limit_next: int | None = None
         self.rate_limit_retry_after_next: str | None = None
         # MINECRAFT-566 comment 55661: a controlled 3xx to prove the proxy
@@ -73,11 +82,23 @@ class FakeUpstream:
 
                 if outer.remark_next:
                     outer.remark_next = False
+                    content_type = outer.remark_content_type
                     payload = json.dumps(
                         {"remark": "runtime error: Query timed out.", "elements": []}
                     ).encode("utf-8")
                     self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
+                    if content_type is not None:
+                        self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+
+                if outer.non_json_success_next:
+                    outer.non_json_success_next = False
+                    payload = b"<overpass><way id='1'/></overpass>"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/xml")
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
