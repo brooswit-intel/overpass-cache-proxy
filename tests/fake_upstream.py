@@ -18,6 +18,15 @@ class FakeUpstream:
         self.call_count = 0
         self.fail_next = False
         self.truncate_next = False
+        # MINECRAFT-566 comment 55657, item 3/4: additional controlled
+        # failure shapes for the proxy's own compatibility fixes --
+        # `remark_next` to prove an HTTP-200-with-error-remark is never
+        # cached, `rate_limit_next`/`rate_limit_retry_after_next` to prove a
+        # safe Retry-After is preserved on an uncached 429/503.
+        self.remark_next = False
+        self.rate_limit_next: int | None = None
+        self.rate_limit_retry_after_next: str | None = None
+        self.last_seen_api_key: str | None = None
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -37,6 +46,7 @@ class FakeUpstream:
             def _handle(self) -> None:
                 data = self._data_param()
                 outer.call_count += 1
+                outer.last_seen_api_key = self.headers.get("X-API-Key")
 
                 if outer.fail_next:
                     outer.fail_next = False
@@ -44,6 +54,33 @@ class FakeUpstream:
                     self.send_response(500)
                     self.send_header("Content-Type", "text/plain")
                     self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+
+                if outer.remark_next:
+                    outer.remark_next = False
+                    payload = json.dumps(
+                        {"remark": "runtime error: Query timed out.", "elements": []}
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+
+                if outer.rate_limit_next is not None:
+                    status = outer.rate_limit_next
+                    retry_after = outer.rate_limit_retry_after_next
+                    outer.rate_limit_next = None
+                    outer.rate_limit_retry_after_next = None
+                    payload = b"rate limited"
+                    self.send_response(status)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(payload)))
+                    if retry_after is not None:
+                        self.send_header("Retry-After", retry_after)
                     self.end_headers()
                     self.wfile.write(payload)
                     return
