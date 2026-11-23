@@ -13,11 +13,37 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from overpass_cache_proxy.server import Config, ProxyServer
 from overpass_cache_proxy.cache import Cache
 
 from fake_upstream import FakeUpstream
+
+
+def _RecordingHandler(hits: list):
+    """A tiny real HTTP server handler that records every request it
+    receives (method, path, headers) -- used as the "different host" a
+    redirect must never actually reach.
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args) -> None:  # noqa: D401
+            pass
+
+        def _record(self) -> None:
+            hits.append({"path": self.path, "headers": dict(self.headers.items())})
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            self._record()
+
+        def do_POST(self) -> None:
+            self._record()
+
+    return Handler
 
 
 def _start_proxy(upstream_url: str, sqlite_path: str) -> ProxyServer:
@@ -477,6 +503,58 @@ class ProxyAcceptanceTests(unittest.TestCase):
         self.assertEqual(status_again, 200)
         self.assertEqual(after_retry["upstream_sends"] - after["upstream_sends"], 1)
         self.assertEqual(after_retry["local_hits"] - after["local_hits"], 0)
+
+    def test_redirect_to_a_different_host_is_never_followed_and_never_leaks_the_api_key(self) -> None:
+        """MINECRAFT-566 comment 55661: urllib's default HTTPRedirectHandler
+        carries every header except Content-Length/Content-Type across a
+        redirect (verified directly against this interpreter's own
+        urllib.request source) and does not restrict the new URL to the
+        same host -- so a 3xx from upstream could otherwise leak the real
+        X-API-Key to a second, different host. Proven here with a REAL
+        second HTTP server standing in for that "different host": the
+        redirect target.
+        """
+        second_host_hits: list = []
+        second_host_srv = HTTPServer(("127.0.0.1", 0), _RecordingHandler(second_host_hits))
+        second_host_thread = threading.Thread(target=second_host_srv.serve_forever, daemon=True)
+        second_host_thread.start()
+        try:
+            upstream = self._new_upstream()
+            config = Config(
+                bind_host="127.0.0.1",
+                bind_port=0,
+                sqlite_path=self.sqlite_path,
+                upstream_url=upstream.url,
+                api_key="must-never-leave-this-proxy",
+            )
+            server = ProxyServer(config, Cache(self.sqlite_path))
+            self._servers.append(server)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            base = _proxy_base(server)
+
+            redirect_target = f"http://127.0.0.1:{second_host_srv.server_address[1]}/stolen"
+            upstream.redirect_next_to = redirect_target
+
+            before = _stats(base)
+            status, body = _post_raw(f"{base}/roads/interpreter", b"a raw overpass ql query", content_type=None)
+            after = _stats(base)
+
+            self.assertEqual(status, 302, body)
+            self.assertEqual(len(second_host_hits), 0, "Expected the redirect target to never actually be contacted")
+            # Counted as one genuine attempted upstream send (the original
+            # upstream really did receive and answer this request), never
+            # cached (a 3xx is not a 200).
+            self.assertEqual(after["upstream_sends"] - before["upstream_sends"], 1)
+            self.assertEqual(after["local_hits"] - before["local_hits"], 0)
+
+            # A retry must genuinely re-reach upstream (not a cached 302).
+            upstream.redirect_next_to = redirect_target
+            status2, _ = _post_raw(f"{base}/roads/interpreter", b"a raw overpass ql query", content_type=None)
+            self.assertEqual(status2, 302)
+            self.assertEqual(len(second_host_hits), 0)
+        finally:
+            second_host_srv.shutdown()
+            second_host_srv.server_close()
 
     def test_offline_pair_acceptance_cold_then_fresh_roads_cache_warm_proxy_cache(self) -> None:
         """MINECRAFT-566 comment 55657, item 5: the exact offline pair

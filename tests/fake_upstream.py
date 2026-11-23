@@ -26,6 +26,10 @@ class FakeUpstream:
         self.remark_next = False
         self.rate_limit_next: int | None = None
         self.rate_limit_retry_after_next: str | None = None
+        # MINECRAFT-566 comment 55661: a controlled 3xx to prove the proxy
+        # never follows a redirect (and so never leaks X-API-Key to
+        # wherever it points).
+        self.redirect_next_to: str | None = None
         self.last_seen_api_key: str | None = None
         outer = self
 
@@ -47,6 +51,15 @@ class FakeUpstream:
                 data = self._data_param()
                 outer.call_count += 1
                 outer.last_seen_api_key = self.headers.get("X-API-Key")
+
+                if outer.redirect_next_to is not None:
+                    target = outer.redirect_next_to
+                    outer.redirect_next_to = None
+                    self.send_response(302)
+                    self.send_header("Location", target)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
 
                 if outer.fail_next:
                     outer.fail_next = False

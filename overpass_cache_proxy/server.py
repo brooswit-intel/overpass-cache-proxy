@@ -17,6 +17,33 @@ from .cache import Cache, CachedResponse
 
 SUPPORTED_PATHS = {"/api/interpreter", "/roads/interpreter"}
 
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """MINECRAFT-566 comment 55661: urllib's default HTTPRedirectHandler
+    follows a 3xx and carries every request header across to the new
+    request EXCEPT Content-Length/Content-Type (verified directly against
+    this interpreter's own urllib.request source, CPython 3.12) -- it does
+    NOT strip Authorization-family headers, and does not restrict the new
+    URL to the same host. Since ``_forward`` attaches the real X-API-Key
+    credential, a malicious or merely misconfigured upstream could 3xx to a
+    different host and still receive that header if the default handler
+    were used.
+
+    Returning ``None`` from ``redirect_request`` makes every ``http_error_30x``
+    method return ``None`` in turn without ever opening the new URL or
+    reading/forwarding anything from it (verified empirically: this makes
+    ``urlopen`` raise ``HTTPError`` for the original 3xx status instead).
+    That HTTPError is handled by ``_forward``'s own existing
+    ``except urllib.error.HTTPError`` branch exactly like any other non-200
+    upstream status -- surfaced uncached to the caller, never followed.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
 # MINECRAFT-566 comment 55657, item 4: a safe numeric Retry-After Roads (or
 # any other RoadTileSource-shaped client) can actually parse -- its own
 # fetchCell only ever parses the plain-integer-seconds form of this header,
@@ -140,7 +167,7 @@ def _forward(config: Config, method: str, data: str):
         )
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _NO_REDIRECT_OPENER.open(req, timeout=30) as resp:
             content_type = resp.headers.get("Content-Type", "application/octet-stream")
             expected_length = resp.headers.get("Content-Length")
             retry_after = resp.headers.get("Retry-After")
