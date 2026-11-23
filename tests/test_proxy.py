@@ -4,18 +4,46 @@ uses a real credential — everything talks to the loopback FakeUpstream.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from overpass_cache_proxy.server import Config, ProxyServer
 from overpass_cache_proxy.cache import Cache
 
 from fake_upstream import FakeUpstream
+
+
+def _RecordingHandler(hits: list):
+    """A tiny real HTTP server handler that records every request it
+    receives (method, path, headers) -- used as the "different host" a
+    redirect must never actually reach.
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args) -> None:  # noqa: D401
+            pass
+
+        def _record(self) -> None:
+            hits.append({"path": self.path, "headers": dict(self.headers.items())})
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            self._record()
+
+        def do_POST(self) -> None:
+            self._record()
+
+    return Handler
 
 
 def _start_proxy(upstream_url: str, sqlite_path: str) -> ProxyServer:
@@ -39,6 +67,59 @@ def _proxy_base(server: ProxyServer) -> str:
 def _get(url: str) -> tuple[int, bytes]:
     try:
         with urllib.request.urlopen(url, timeout=5) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+def _get_with_headers(url: str) -> tuple[int, dict]:
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return resp.status, dict(resp.headers.items())
+    except urllib.error.HTTPError as exc:
+        return exc.code, dict(exc.headers.items()) if exc.headers else {}
+
+
+def _post_raw(
+    url: str,
+    body: bytes,
+    content_type: str | None,
+    extra_request_headers: dict | None = None,
+) -> tuple[int, bytes]:
+    """POST exactly the given raw bytes, with no form encoding -- this is the
+    real wire shape Roads' own RoadTileSource.fetchCell sends (no form
+    wrapping, and ordinarily no Content-Type header at all).
+
+    Uses http.client directly, not urllib.request: urllib's own
+    AbstractHTTPHandler silently injects
+    ``Content-type: application/x-www-form-urlencoded`` whenever a POST has
+    a body and no Content-Type header is set, which would defeat the exact
+    no-Content-Type wire shape this helper exists to reproduce.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+    try:
+        headers = dict(extra_request_headers or {})
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+def _post_form(url: str, form: dict) -> tuple[int, bytes]:
+    body = urllib.parse.urlencode(form).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
@@ -240,6 +321,423 @@ class ProxyAcceptanceTests(unittest.TestCase):
         status, _ = _get(f"{base}/not-a-real-endpoint?data=x")
         self.assertEqual(status, 501)
         self.assertEqual(upstream.call_count, 0)
+
+    def test_roads_raw_post_body_is_accepted_and_cached_like_any_other_query(self) -> None:
+        """MINECRAFT-566 comment 55657, item 1: Roads' real RoadTileSource
+        POSTs the Overpass QL query as the entire raw body, with no form
+        encoding and no Content-Type header at all -- not a `data=`-wrapped
+        form field. This reproduces that exact wire shape (no Content-Type
+        header set) rather than a Roads-side fake.
+        """
+        upstream = self._new_upstream()
+        proxy = self._new_proxy(upstream.url)
+        base = _proxy_base(proxy)
+        query = '[out:json][timeout:30];(way["highway"~"^(primary)$"](41.0,-96.0,41.1,-95.9););out geom;'
+
+        before = _stats(base)
+        status1, body1 = _post_raw(f"{base}/roads/interpreter", query.encode("utf-8"), content_type=None)
+        after_first = _stats(base)
+
+        self.assertEqual(status1, 200, body1)
+        self.assertEqual(upstream.call_count, 1)
+        self.assertEqual(after_first["upstream_sends"] - before["upstream_sends"], 1)
+
+        # Identical raw-body request again: must be a cache hit, not a
+        # second upstream send.
+        status2, body2 = _post_raw(f"{base}/roads/interpreter", query.encode("utf-8"), content_type=None)
+        after_second = _stats(base)
+
+        self.assertEqual(status2, 200)
+        self.assertEqual(body1, body2)
+        self.assertEqual(upstream.call_count, 1)
+        self.assertEqual(after_second["local_hits"] - after_first["local_hits"], 1)
+        self.assertEqual(after_second["upstream_sends"] - after_first["upstream_sends"], 0)
+
+    def test_existing_form_encoded_post_still_works_alongside_raw_post(self) -> None:
+        """Preserving existing form-data handling for a caller that actually
+        declares application/x-www-form-urlencoded, in the same proxy
+        instance a raw-body Roads-shaped caller also uses.
+        """
+        upstream = self._new_upstream()
+        proxy = self._new_proxy(upstream.url)
+        base = _proxy_base(proxy)
+
+        status, body = _post_form(f"{base}/api/interpreter", {"data": "form-encoded-query"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(upstream.call_count, 1)
+
+    def test_malformed_post_with_no_body_and_no_form_field_is_rejected(self) -> None:
+        upstream = self._new_upstream()
+        proxy = self._new_proxy(upstream.url)
+        base = _proxy_base(proxy)
+
+        status, _ = _post_raw(f"{base}/roads/interpreter", b"", content_type=None)
+        self.assertEqual(status, 400)
+        self.assertEqual(upstream.call_count, 0)
+
+    def test_proxy_never_forwards_a_client_supplied_credential_to_upstream(self) -> None:
+        """MINECRAFT-566 comment 55657, item 2: a client-supplied Authorization
+        header must never reach upstream -- only the proxy's OWN configured
+        api_key, via X-API-Key, is ever a candidate for being sent (and only
+        to the official endpoint; see the key-binding tests below).
+        """
+        upstream = self._new_upstream()
+        config = Config(
+            bind_host="127.0.0.1",
+            bind_port=0,
+            sqlite_path=self.sqlite_path,
+            upstream_url=upstream.url,
+            api_key=None,
+        )
+        server = ProxyServer(config, Cache(self.sqlite_path))
+        self._servers.append(server)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = _proxy_base(server)
+
+        status, body = _post_raw(
+            f"{base}/roads/interpreter",
+            b"a raw overpass ql query",
+            content_type=None,
+            extra_request_headers={"Authorization": "Bearer a-client-supplied-credential"},
+        )
+        self.assertEqual(status, 200, body)
+        self.assertIsNone(upstream.last_seen_api_key)
+
+    def test_configured_key_is_never_sent_to_a_non_official_upstream_url_even_on_the_initial_request(self) -> None:
+        """MINECRAFT-566 comment 55663: a configured api_key must only ever
+        go out to the documented official endpoint -- never to whatever
+        upstream_url happens to be configured, including on the very FIRST
+        request (not just "after a redirect" -- there is no redirect
+        involved in this test at all). Uses the repo's own fake-upstream
+        fixture and a fake, clearly-not-real key; no real credential.
+        """
+        upstream = self._new_upstream()
+        config = Config(
+            bind_host="127.0.0.1",
+            bind_port=0,
+            sqlite_path=self.sqlite_path,
+            upstream_url=upstream.url,  # a loopback fake -- NOT the official endpoint
+            api_key="a-fake-key-that-must-never-be-sent-to-a-non-official-endpoint",
+        )
+        server = ProxyServer(config, Cache(self.sqlite_path))
+        self._servers.append(server)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = _proxy_base(server)
+
+        status, body = _post_raw(f"{base}/roads/interpreter", b"a raw overpass ql query", content_type=None)
+
+        self.assertEqual(status, 200, f"Expected the request to still be forwarded, just keyless; body={body!r}")
+        self.assertIsNone(upstream.last_seen_api_key, "Expected no X-API-Key header on a non-official upstream_url")
+        self.assertEqual(upstream.call_count, 1, "Expected the request to actually reach the (fake) upstream")
+
+    def test_should_send_api_key_to_only_matches_the_exact_official_endpoint(self) -> None:
+        from overpass_cache_proxy.server import OFFICIAL_INTERPRETER_ENDPOINT, _should_send_api_key_to
+
+        self.assertTrue(_should_send_api_key_to(OFFICIAL_INTERPRETER_ENDPOINT))
+        self.assertFalse(_should_send_api_key_to("http://api.overpass.ch/v1/interpreter"))  # wrong scheme
+        self.assertFalse(_should_send_api_key_to("https://api.overpass.ch/v1/interpreter/"))  # trailing slash
+        self.assertFalse(_should_send_api_key_to("https://overpass.ch/api/interpreter"))  # the old placeholder
+        self.assertFalse(_should_send_api_key_to("https://evil.example/v1/interpreter"))  # different host entirely
+        self.assertFalse(_should_send_api_key_to("http://127.0.0.1:8822/api/interpreter"))  # a loopback fake
+
+    def test_default_upstream_url_is_the_real_documented_contract(self) -> None:
+        self.assertEqual(Config().upstream_url, "https://api.overpass.ch/v1/interpreter")
+
+    def test_200_with_error_remark_is_never_cached_then_recovers_and_caches(self) -> None:
+        """MINECRAFT-566 comment 55657, item 3: an HTTP 200 whose JSON body
+        carries a non-empty top-level "remark" (Overpass's own runtime-error
+        signal) must never be cached. A subsequent identical request, once
+        upstream actually succeeds, must genuinely re-reach upstream (not a
+        stale cached error) and then cache normally.
+        """
+        upstream = self._new_upstream()
+        proxy = self._new_proxy(upstream.url)
+        base = _proxy_base(proxy)
+        query_url = f"{base}/roads/interpreter?data=transient-error-query"
+
+        upstream.remark_next = True
+        before = _stats(base)
+        status1, body1 = _get(query_url)
+        after_remark = _stats(base)
+
+        self.assertEqual(status1, 200)
+        self.assertEqual(json.loads(body1).get("remark"), "runtime error: Query timed out.")
+        self.assertEqual(upstream.call_count, 1)
+        self.assertEqual(after_remark["upstream_sends"] - before["upstream_sends"], 1)
+        self.assertEqual(after_remark["local_hits"] - before["local_hits"], 0)
+
+        # Not cached: a second identical request genuinely re-reaches
+        # upstream (now a real, recoverable success).
+        status2, body2 = _get(query_url)
+        after_recovery = _stats(base)
+
+        self.assertEqual(status2, 200)
+        self.assertNotIn("remark", json.loads(body2))
+        self.assertEqual(upstream.call_count, 2)
+        self.assertEqual(after_recovery["upstream_sends"] - after_remark["upstream_sends"], 1)
+        self.assertEqual(after_recovery["local_hits"] - after_remark["local_hits"], 0)
+
+        # And now it's genuinely warm.
+        status3, body3 = _get(query_url)
+        after_hit = _stats(base)
+
+        self.assertEqual(status3, 200)
+        self.assertEqual(body3, body2)
+        self.assertEqual(upstream.call_count, 2)
+        self.assertEqual(after_hit["local_hits"] - after_recovery["local_hits"], 1)
+        self.assertEqual(after_hit["upstream_sends"] - after_recovery["upstream_sends"], 0)
+
+    def test_200_with_error_remark_is_detected_regardless_of_content_type_casing_or_absence(self) -> None:
+        """MINECRAFT-566 comment 55669 (brooswit review, CHANGES_REQUESTED on
+        3e1085c): the previous ``_is_uncacheable_error_remark`` gated the
+        whole check on a case-SENSITIVE ``"json" in content_type`` substring
+        match before ever looking at the body -- a standards-valid but
+        differently-cased ``Content-Type: Application/JSON`` (HTTP media
+        types are case-insensitive per RFC 9110) bypassed the check
+        entirely and got cached. Detection must be body-based, exactly like
+        Roads' own ``checkForErrorRemark`` -- proven here for a
+        non-canonical mixed-case Content-Type AND for a missing one
+        entirely (this proxy's own ``_forward`` already falls back to
+        ``application/octet-stream`` when upstream sends no Content-Type at
+        all, so this is a real, reachable case, not a hypothetical one).
+        """
+        self._assert_remark_never_cached_then_recovers(remark_content_type="Application/JSON")
+        self._assert_remark_never_cached_then_recovers(remark_content_type="APPLICATION/JSON; charset=UTF-8")
+        self._assert_remark_never_cached_then_recovers(remark_content_type=None)  # no Content-Type header at all
+
+    def _assert_remark_never_cached_then_recovers(self, remark_content_type: str | None) -> None:
+        """The exact same never-cached-then-recovers contract as
+        ``test_200_with_error_remark_is_never_cached_then_recovers_and_caches``
+        above, parameterized over the upstream's Content-Type casing/
+        presence -- the real regression the 55669 fix must prove.
+        """
+        upstream = self._new_upstream()
+        upstream.remark_content_type = remark_content_type
+        proxy = self._new_proxy(upstream.url)
+        base = _proxy_base(proxy)
+        label = urllib.parse.quote(str(remark_content_type), safe="")
+        query_url = f"{base}/roads/interpreter?data=mixed-case-content-type-remark-query-{label}"
+
+        upstream.remark_next = True
+        before = _stats(base)
+        status1, body1 = _get(query_url)
+        after_remark = _stats(base)
+
+        self.assertEqual(status1, 200)
+        self.assertEqual(json.loads(body1).get("remark"), "runtime error: Query timed out.")
+        self.assertEqual(upstream.call_count, 1)
+        self.assertEqual(after_remark["upstream_sends"] - before["upstream_sends"], 1)
+        self.assertEqual(after_remark["local_hits"] - before["local_hits"], 0,
+                          f"Expected the remark response (Content-Type={remark_content_type!r}) to NOT be cached")
+
+        # Not cached: the identical retry genuinely re-reaches upstream
+        # (now a real, recoverable success), never served stale from SQLite.
+        status2, body2 = _get(query_url)
+        after_recovery = _stats(base)
+
+        self.assertEqual(status2, 200)
+        self.assertNotIn("remark", json.loads(body2))
+        self.assertEqual(upstream.call_count, 2, "Expected the retry to actually reach upstream again, not a cache hit")
+        self.assertEqual(after_recovery["upstream_sends"] - after_remark["upstream_sends"], 1)
+        self.assertEqual(after_recovery["local_hits"] - after_remark["local_hits"], 0)
+
+        # The real success response, once it happens, DOES cache normally.
+        status3, body3 = _get(query_url)
+        after_hit = _stats(base)
+
+        self.assertEqual(status3, 200)
+        self.assertEqual(body3, body2)
+        self.assertEqual(upstream.call_count, 2)
+        self.assertEqual(after_hit["local_hits"] - after_recovery["local_hits"], 1)
+        self.assertEqual(after_hit["upstream_sends"] - after_recovery["upstream_sends"], 0)
+
+    def test_non_json_success_body_still_caches_normally_after_the_body_based_remark_fix(self) -> None:
+        """Regression guard for the 55669 fix's own stated risk: making
+        remark detection body-based (dropping the Content-Type gate
+        entirely) must not accidentally stop caching a genuine non-JSON
+        success response. A real XML (or any other non-JSON) 200 body
+        simply fails json.loads inside _is_uncacheable_error_remark --
+        falls through its except clause -- and is cached exactly as before.
+        """
+        upstream = self._new_upstream()
+        upstream.non_json_success_next = True
+        proxy = self._new_proxy(upstream.url)
+        base = _proxy_base(proxy)
+        query_url = f"{base}/roads/interpreter?data=non-json-success-query"
+
+        before = _stats(base)
+        status1, body1 = _get(query_url)
+        after_first = _stats(base)
+
+        self.assertEqual(status1, 200)
+        self.assertEqual(body1, b"<overpass><way id='1'/></overpass>")
+        self.assertEqual(upstream.call_count, 1)
+        self.assertEqual(after_first["upstream_sends"] - before["upstream_sends"], 1)
+        self.assertEqual(after_first["local_hits"] - before["local_hits"], 0)
+
+        # Cached normally: the identical request is now a local hit, no
+        # second upstream send.
+        status2, body2 = _get(query_url)
+        after_second = _stats(base)
+
+        self.assertEqual(status2, 200)
+        self.assertEqual(body2, body1)
+        self.assertEqual(upstream.call_count, 1, "Expected NO second upstream send -- the non-JSON success was cached")
+        self.assertEqual(after_second["local_hits"] - after_first["local_hits"], 1)
+        self.assertEqual(after_second["upstream_sends"] - after_first["upstream_sends"], 0)
+
+    def test_uncached_429_preserves_a_safe_numeric_retry_after(self) -> None:
+        self._assert_safe_retry_after_preserved(status=429, upstream_retry_after="17")
+
+    def test_uncached_503_preserves_a_safe_numeric_retry_after(self) -> None:
+        self._assert_safe_retry_after_preserved(status=503, upstream_retry_after="42")
+
+    def test_uncached_429_without_an_upstream_retry_after_still_gets_a_safe_default(self) -> None:
+        self._assert_safe_retry_after_preserved(status=429, upstream_retry_after=None)
+
+    def test_non_numeric_upstream_retry_after_falls_back_to_a_safe_default(self) -> None:
+        # RFC 9110 also permits an HTTP-date Retry-After; Roads' own
+        # RoadTileSource only parses the numeric-seconds form, so the proxy
+        # must not forward a non-numeric value verbatim.
+        self._assert_safe_retry_after_preserved(
+            status=503, upstream_retry_after="Wed, 21 Oct 2026 07:28:00 GMT", expect_default=True
+        )
+
+    def _assert_safe_retry_after_preserved(
+        self, status: int, upstream_retry_after: str | None, expect_default: bool = False
+    ) -> None:
+        upstream = self._new_upstream()
+        proxy = self._new_proxy(upstream.url)
+        base = _proxy_base(proxy)
+
+        upstream.rate_limit_next = status
+        upstream.rate_limit_retry_after_next = upstream_retry_after
+        before = _stats(base)
+        resp_status, headers = _get_with_headers(f"{base}/roads/interpreter?data=rate-limited-query")
+        after = _stats(base)
+
+        self.assertEqual(resp_status, status)
+        self.assertEqual(after["upstream_sends"] - before["upstream_sends"], 1)
+        self.assertEqual(after["local_hits"] - before["local_hits"], 0)
+        retry_after_header = headers.get("Retry-After")
+        self.assertIsNotNone(retry_after_header, "Expected a Retry-After header on an uncached 429/503")
+        parsed = int(retry_after_header)
+        self.assertGreaterEqual(parsed, 0)
+        if expect_default or upstream_retry_after is None:
+            from overpass_cache_proxy.server import _DEFAULT_RETRY_AFTER_SECONDS
+
+            self.assertEqual(parsed, _DEFAULT_RETRY_AFTER_SECONDS)
+        else:
+            self.assertEqual(parsed, int(upstream_retry_after))
+
+        # Never cached: a retry genuinely reaches upstream again.
+        status_again, _ = _get(f"{base}/roads/interpreter?data=rate-limited-query")
+        after_retry = _stats(base)
+        self.assertEqual(status_again, 200)
+        self.assertEqual(after_retry["upstream_sends"] - after["upstream_sends"], 1)
+        self.assertEqual(after_retry["local_hits"] - after["local_hits"], 0)
+
+    def test_redirect_to_a_different_host_is_never_followed_and_never_leaks_the_api_key(self) -> None:
+        """MINECRAFT-566 comment 55661: urllib's default HTTPRedirectHandler
+        carries every header except Content-Length/Content-Type across a
+        redirect (verified directly against this interpreter's own
+        urllib.request source) and does not restrict the new URL to the
+        same host -- so a 3xx from upstream could otherwise leak the real
+        X-API-Key to a second, different host. Proven here with a REAL
+        second HTTP server standing in for that "different host": the
+        redirect target.
+        """
+        second_host_hits: list = []
+        second_host_srv = HTTPServer(("127.0.0.1", 0), _RecordingHandler(second_host_hits))
+        second_host_thread = threading.Thread(target=second_host_srv.serve_forever, daemon=True)
+        second_host_thread.start()
+        try:
+            upstream = self._new_upstream()
+            config = Config(
+                bind_host="127.0.0.1",
+                bind_port=0,
+                sqlite_path=self.sqlite_path,
+                upstream_url=upstream.url,
+                api_key="must-never-leave-this-proxy",
+            )
+            server = ProxyServer(config, Cache(self.sqlite_path))
+            self._servers.append(server)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            base = _proxy_base(server)
+
+            redirect_target = f"http://127.0.0.1:{second_host_srv.server_address[1]}/stolen"
+            upstream.redirect_next_to = redirect_target
+
+            before = _stats(base)
+            status, body = _post_raw(f"{base}/roads/interpreter", b"a raw overpass ql query", content_type=None)
+            after = _stats(base)
+
+            self.assertEqual(status, 302, body)
+            self.assertEqual(len(second_host_hits), 0, "Expected the redirect target to never actually be contacted")
+            # Counted as one genuine attempted upstream send (the original
+            # upstream really did receive and answer this request), never
+            # cached (a 3xx is not a 200).
+            self.assertEqual(after["upstream_sends"] - before["upstream_sends"], 1)
+            self.assertEqual(after["local_hits"] - before["local_hits"], 0)
+
+            # A retry must genuinely re-reach upstream (not a cached 302).
+            upstream.redirect_next_to = redirect_target
+            status2, _ = _post_raw(f"{base}/roads/interpreter", b"a raw overpass ql query", content_type=None)
+            self.assertEqual(status2, 302)
+            self.assertEqual(len(second_host_hits), 0)
+        finally:
+            second_host_srv.shutdown()
+            second_host_srv.server_close()
+
+    def test_offline_pair_acceptance_cold_then_fresh_roads_cache_warm_proxy_cache(self) -> None:
+        """MINECRAFT-566 comment 55657, item 5: the exact offline pair
+        acceptance contract against a REAL running proxy and a fake
+        upstream, driven with a request byte-for-byte matching what Roads'
+        own RoadTileSource.fetchCell actually sends (raw POST body, no form
+        encoding, no Content-Type header, the real /roads/interpreter path).
+
+        Honest scope note: this repo's test harness cannot start a real
+        Roads JVM, so "Roads HTTP send" here is this test's own POST call to
+        the real, live proxy using Roads' exact wire format -- not a second,
+        separate fake object asserting on something else. The proxy side
+        (local_hits/upstream_sends) is the real Cache/Config/ProxyServer
+        code, not a stand-in.
+        """
+        upstream = self._new_upstream()
+        proxy = self._new_proxy(upstream.url)
+        base = _proxy_base(proxy)
+        query = '[out:json][timeout:30];(way["highway"~"^(secondary)$"](41.0,-96.0,41.1,-95.9););out geom;'
+        url = f"{base}/roads/interpreter"
+
+        # Cold: a fresh Roads-shaped request must reach the real fake
+        # upstream exactly once.
+        before = _stats(base)
+        roads_http_sends = 0
+        status1, body1 = _post_raw(url, query.encode("utf-8"), content_type=None)
+        roads_http_sends += 1
+        after_cold = _stats(base)
+
+        self.assertEqual(status1, 200, body1)
+        self.assertEqual(upstream.call_count, 1)
+        self.assertEqual(after_cold["upstream_sends"] - before["upstream_sends"], 1)
+        self.assertEqual(after_cold["local_hits"] - before["local_hits"], 0)
+
+        # "Fresh Roads cache" (a real Roads process would not yet have this
+        # exact query cached either, since it's never seen it before) but a
+        # now-warm proxy SQLite cache: the identical method/path/query must
+        # yield +1 Roads HTTP send (this POST), +1 proxy-side SQLite hit,
+        # +0 further upstream sends.
+        status2, body2 = _post_raw(url, query.encode("utf-8"), content_type=None)
+        roads_http_sends += 1
+        after_warm = _stats(base)
+
+        self.assertEqual(status2, 200, body2)
+        self.assertEqual(body1, body2)
+        self.assertEqual(upstream.call_count, 1, "Expected zero further upstream sends against a warm proxy cache")
+        self.assertEqual(after_warm["local_hits"] - after_cold["local_hits"], 1)
+        self.assertEqual(after_warm["upstream_sends"] - after_cold["upstream_sends"], 0)
+        self.assertEqual(roads_http_sends, 2, "One Roads-shaped HTTP send for the cold request, one for the warm one")
 
 
 if __name__ == "__main__":
