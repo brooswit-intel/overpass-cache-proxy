@@ -17,6 +17,7 @@ class FakeUpstream:
     def __init__(self) -> None:
         self.call_count = 0
         self.fail_next = False
+        self.truncate_next = False
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -45,6 +46,23 @@ class FakeUpstream:
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
+                    return
+
+                if outer.truncate_next:
+                    outer.truncate_next = False
+                    full_payload = json.dumps(
+                        {"echo": data, "elements": [1, 2, 3]}
+                    ).encode("utf-8")
+                    # Declare the real Content-Length, then only deliver a
+                    # fraction of it and close the connection: a genuine
+                    # mid-body truncation, not a clean short response.
+                    truncated = full_payload[: max(1, len(full_payload) // 4)]
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(full_payload)))
+                    self.end_headers()
+                    self.wfile.write(truncated)
+                    self.close_connection = True
                     return
 
                 payload = json.dumps({"echo": data, "elements": [1, 2, 3]}).encode("utf-8")

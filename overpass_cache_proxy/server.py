@@ -5,6 +5,7 @@ forwarding only cache misses to the configured upstream.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import urllib.error
@@ -52,10 +53,21 @@ class Config:
 def _forward(config: Config, method: str, data: str, client_auth: str | None):
     """Make one actual network send to the configured upstream.
 
-    Returns (status, content_type, body, complete). ``complete`` is False
-    whenever the response shouldn't be trusted as cacheable — a non-2xx
-    upstream status, or a 200 whose body didn't match its own
-    Content-Length.
+    This function always returns a 4-tuple and never raises for a network
+    or transport failure — every way the send can go wrong (refused
+    connection, a non-2xx status, or the peer closing mid-body) is folded
+    into the return value so the caller has exactly one place to decide
+    whether to count the send and whether anything is cacheable.
+
+    Returns (status, content_type, body, complete):
+    - ``status`` is 0 if no response was ever received at all (the
+      connection itself failed — refused, DNS, timeout before any bytes
+      came back). A real HTTP status (including non-2xx) means the
+      upstream *did* receive and respond to the request.
+    - ``complete`` is False whenever the response shouldn't be trusted as
+      cacheable — a non-2xx upstream status, or a response (including a
+      declared-200) whose body didn't match its own Content-Length because
+      the connection was closed early.
     """
     headers: dict[str, str] = {}
     if client_auth:
@@ -77,7 +89,15 @@ def _forward(config: Config, method: str, data: str, client_auth: str | None):
         with urllib.request.urlopen(req, timeout=30) as resp:
             content_type = resp.headers.get("Content-Type", "application/octet-stream")
             expected_length = resp.headers.get("Content-Length")
-            raw = resp.read()
+            try:
+                raw = resp.read()
+            except (http.client.HTTPException, OSError):
+                # The upstream accepted the request and started responding
+                # (we have a status and headers) but closed before
+                # delivering the body it promised. This is a genuine
+                # upstream send — it must still be counted — just not one
+                # whose body can be trusted or cached.
+                return resp.status, content_type, b"", False
             complete = expected_length is None or len(raw) == int(expected_length)
             return resp.status, content_type, raw, complete
     except urllib.error.HTTPError as exc:
@@ -86,6 +106,11 @@ def _forward(config: Config, method: str, data: str, client_auth: str | None):
         )
         raw = exc.read()
         return exc.code, content_type, raw, False
+    except urllib.error.URLError:
+        # Never reached the upstream at all (refused/unresolvable/timed out
+        # before any response). Still an attempted send from this proxy's
+        # point of view, but there is no status or body to speak of.
+        return 0, "text/plain", b"", False
 
 
 def make_handler(cache: Cache, config: Config):
@@ -150,18 +175,29 @@ def make_handler(cache: Cache, config: Config):
                 status, content_type, body, complete = _forward(
                     config, method, data, forwarded_auth
                 )
-            except urllib.error.URLError:
+            except Exception:
+                # _forward is designed to never raise — every transport
+                # failure it can hit is folded into its return value — but
+                # this is the one place a send is counted, so an unexpected
+                # exception here must still be counted as an attempted send
+                # and must still produce a retryable response rather than
+                # crashing the request silently.
                 cache.record_upstream_send()
                 self._respond_plain(502, b"upstream unreachable")
                 return
 
-            # Every branch below reached an actual upstream send, whether or
-            # not the response is cacheable.
+            # Every branch below reached this point via a real attempt to
+            # reach the upstream, whether or not it succeeded or is
+            # cacheable — count it exactly once, here, unconditionally.
             cache.record_upstream_send()
 
             if status == 200 and complete:
                 cache.put(key, CachedResponse(status=200, content_type=content_type, body=body))
                 self._respond_bytes(status, content_type, body)
+                return
+
+            if status == 0:
+                self._respond_plain(502, b"upstream unreachable")
                 return
 
             if status == 200 and not complete:

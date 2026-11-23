@@ -193,6 +193,46 @@ class ProxyAcceptanceTests(unittest.TestCase):
         self.assertEqual(after_hit["local_hits"] - after_retry["local_hits"], 1)
         self.assertEqual(after_hit["upstream_sends"] - after_retry["upstream_sends"], 0)
 
+    def test_truncated_response_is_retryable_not_cached_and_counted_as_a_send(self) -> None:
+        """Regression for the CHANGES_REQUESTED finding: a peer that
+        declares a Content-Length and then closes mid-body must not crash
+        the request, must not be cached, and must still be counted as one
+        genuine upstream send (the upstream did receive the request).
+        """
+        upstream = self._new_upstream()
+        proxy = self._new_proxy(upstream.url)
+        base = _proxy_base(proxy)
+        query_url = f"{base}/roads/interpreter?data=truncated-query"
+
+        upstream.truncate_next = True
+        before = _stats(base)
+        status1, body1 = _get(query_url)
+        after_truncated = _stats(base)
+
+        self.assertEqual(status1, 502)
+        self.assertEqual(upstream.call_count, 1)
+        self.assertEqual(after_truncated["upstream_sends"] - before["upstream_sends"], 1)
+        self.assertEqual(after_truncated["local_hits"] - before["local_hits"], 0)
+
+        # Not cached: a retry genuinely reaches the upstream again.
+        status2, body2 = _get(query_url)
+        after_retry = _stats(base)
+
+        self.assertEqual(status2, 200)
+        self.assertEqual(upstream.call_count, 2)
+        self.assertEqual(after_retry["upstream_sends"] - after_truncated["upstream_sends"], 1)
+        self.assertEqual(after_retry["local_hits"] - after_truncated["local_hits"], 0)
+
+        # And now it's warm.
+        status3, body3 = _get(query_url)
+        after_hit = _stats(base)
+
+        self.assertEqual(status3, 200)
+        self.assertEqual(body3, body2)
+        self.assertEqual(upstream.call_count, 2)
+        self.assertEqual(after_hit["local_hits"] - after_retry["local_hits"], 1)
+        self.assertEqual(after_hit["upstream_sends"] - after_retry["upstream_sends"], 0)
+
     def test_unsupported_path_is_rejected_not_silently_dropped(self) -> None:
         upstream = self._new_upstream()
         proxy = self._new_proxy(upstream.url)
